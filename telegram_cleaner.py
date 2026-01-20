@@ -17,7 +17,6 @@ from telethon.errors import FloodWaitError
 from telethon.tl.types import (
     Channel,
     Chat,
-    Dialog,
     User,
 )
 from textual.app import App, ComposeResult
@@ -36,7 +35,9 @@ SESSION_NAME = os.getenv("TG_SESSION_NAME", "telegram_cleaner")
 
 DEFAULT_MESSAGE_LIMIT = 100
 RATE_LIMIT_DELAY = 0.5  # seconds between API calls
-KEEP_FILE = Path("keep.json")  # Chats to skip during collect
+KEEP_FILE = Path("non-delete.json")  # Chats to keep (skip during collect and clean)
+FRESH_CHATS_FILE = Path("fresh_chats_cache.json")  # Cache of active chats with last message date
+DELETED_CHATS_FILE = Path("deleted_chats.json")  # Chats already cleaned (skip during collect)
 
 
 class FloodWaitStop(Exception):
@@ -170,6 +171,81 @@ def add_to_keep_list(chat: dict[str, Any], keep_file: Path = KEEP_FILE) -> None:
         keep_file.write_text(json.dumps(existing, indent=2, ensure_ascii=False))
 
 
+def load_deleted_chats(deleted_file: Path = DELETED_CHATS_FILE) -> set[int]:
+    """Load the set of chat IDs that have been cleaned (deleted).
+
+    Args:
+        deleted_file: Path to the deleted chats JSON file.
+
+    Returns:
+        Set of chat IDs that have been cleaned.
+    """
+    if not deleted_file.exists():
+        return set()
+    try:
+        with deleted_file.open() as f:
+            chats = json.load(f)
+            return {chat.get("id") for chat in chats if chat.get("id") is not None}
+    except (json.JSONDecodeError, OSError):
+        return set()
+
+
+def add_to_deleted_chats(chat: dict[str, Any], deleted_file: Path = DELETED_CHATS_FILE) -> None:
+    """Add a chat to the deleted chats list.
+
+    Args:
+        chat: Chat dictionary to add to the deleted list.
+        deleted_file: Path to the deleted chats JSON file.
+    """
+    existing: list[dict[str, Any]] = []
+    if deleted_file.exists():
+        try:
+            with deleted_file.open() as f:
+                existing = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            existing = []
+
+    existing_ids = {c.get("id") for c in existing}
+    if chat.get("id") not in existing_ids:
+        existing.append(chat)
+        deleted_file.write_text(json.dumps(existing, indent=2, ensure_ascii=False))
+
+
+def load_fresh_chats_cache(cache_file: Path = FRESH_CHATS_FILE) -> dict[int, dict[str, Any]]:
+    """Load the cache of fresh (active) chats with their next check dates.
+
+    Args:
+        cache_file: Path to the cache JSON file.
+
+    Returns:
+        Dictionary mapping chat ID to cache entry with next_check date.
+    """
+    if not cache_file.exists():
+        return {}
+    try:
+        with cache_file.open() as f:
+            data = json.load(f)
+            # Convert string keys back to int
+            return {int(k): v for k, v in data.items()}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_fresh_chats_cache(
+    cache_file: Path,
+    cache: dict[int, dict[str, Any]],
+) -> None:
+    """Save the fresh chats cache to file.
+
+    Args:
+        cache_file: Path to the cache JSON file.
+        cache: Dictionary mapping chat ID to cache entry.
+    """
+    # Convert int keys to strings for JSON
+    data = {str(k): v for k, v in cache.items()}
+    cache_file.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+
+
 class ChatsViewerApp(App[None]):
     """TUI app to view and navigate chats."""
 
@@ -179,8 +255,7 @@ class ChatsViewerApp(App[None]):
         ("q", "quit", "Quit"),
         ("j", "cursor_down", "Down"),
         ("k", "cursor_up", "Up"),
-        ("d", "remove_chat", "Delete"),
-        ("s", "keep_chat", "Keep"),
+        ("x", "keep_chat", "Keep"),
     ]
 
     def __init__(self, chats: list[dict[str, Any]], file_path: Path) -> None:
@@ -202,8 +277,12 @@ class ChatsViewerApp(App[None]):
         table.add_columns("Name", "Type", "Last Message")
         self._refresh_table()
 
-    def _refresh_table(self) -> None:
-        """Refresh the table with current chats data."""
+    def _refresh_table(self, cursor_row: int | None = None) -> None:
+        """Refresh the table with current chats data.
+
+        Args:
+            cursor_row: Row index to restore cursor to after refresh.
+        """
         table = self.query_one(DataTable)
         table.clear()
         self.row_keys = []
@@ -217,6 +296,12 @@ class ChatsViewerApp(App[None]):
             row_key = table.add_row(name, chat_type, last_date)
             self.row_keys.append(row_key)
 
+        # Restore cursor position
+        if cursor_row is not None and self.chats:
+            # Clamp to valid range (stay at same position or move to last if we were at end)
+            new_row = min(cursor_row, len(self.chats) - 1)
+            table.move_cursor(row=new_row)
+
     def action_cursor_down(self) -> None:
         table = self.query_one(DataTable)
         table.action_cursor_down()
@@ -225,33 +310,9 @@ class ChatsViewerApp(App[None]):
         table = self.query_one(DataTable)
         table.action_cursor_up()
 
-    def action_remove_chat(self) -> None:
-        """Remove the currently selected chat from the list and save."""
-        table = self.query_one(DataTable)
-        if table.row_count == 0:
-            self.notify("No chats to remove", severity="warning")
-            return
-
-        # Get current cursor row index
-        row_index = table.cursor_row
-        if row_index is None or row_index < 0 or row_index >= len(self.chats):
-            self.notify("No chat selected", severity="warning")
-            return
-
-        # Get chat name for notification
-        chat_name = self.chats[row_index].get("name", "Unknown")
-
-        # Remove from our data
-        del self.chats[row_index]
-
-        # Save to file
-        save_chats_to_json(self.file_path, self.chats)
-
-        # Refresh the table
-        self._refresh_table()
-
-        # Notify user
-        self.notify(f"Removed: {chat_name}")
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Handle Enter key on a row - keep the chat."""
+        self.action_keep_chat()
 
     def action_keep_chat(self) -> None:
         """Mark the selected chat to keep (skip in future collects) and remove from list."""
@@ -266,30 +327,36 @@ class ChatsViewerApp(App[None]):
             self.notify("No chat selected", severity="warning")
             return
 
+        # Get the row key for removal
+        row_key = self.row_keys[row_index]
+
         # Get the chat data
         chat = self.chats[row_index]
         chat_name = chat.get("name", "Unknown")
 
-        # Add to keep list
+        # Add to keep list (non-delete.json)
         add_to_keep_list(chat)
 
         # Remove from our data
         del self.chats[row_index]
+        del self.row_keys[row_index]
 
-        # Save to file
+        # Remove row from table directly
+        table.remove_row(row_key)
+
+        # Save to file (removes from chats_to_delete.json)
         save_chats_to_json(self.file_path, self.chats)
 
-        # Refresh the table
-        self._refresh_table()
-
         # Notify user
-        self.notify(f"Keeping: {chat_name}")
+        self.notify(f"Kept: {chat_name}")
 
 
 async def collect_inactive_chats(
     output_path: Path,
     months: int,
     limit: int | None = None,
+    fresh_cache_path: Path = FRESH_CHATS_FILE,
+    deleted_chats_path: Path = DELETED_CHATS_FILE,
 ) -> None:
     """Collect chats where last activity was older than specified months.
 
@@ -297,32 +364,111 @@ async def collect_inactive_chats(
         output_path: Path to write the JSON output.
         months: Number of months of inactivity threshold.
         limit: Maximum number of inactive chats to collect (None for unlimited).
+        fresh_cache_path: Path to the fresh chats cache file.
+        deleted_chats_path: Path to the deleted chats file.
     """
     # Load keep list to skip
     keep_ids = load_keep_list()
     if keep_ids:
         click.echo(f"Skipping {len(keep_ids)} chats from keep list")
 
+    # Load deleted chats to skip
+    deleted_ids = load_deleted_chats(deleted_chats_path)
+    if deleted_ids:
+        click.echo(f"Skipping {len(deleted_ids)} already cleaned chats")
+
+    # Load existing chats from output file if it exists
+    existing_chats: list[dict[str, Any]] = []
+    existing_ids: set[int] = set()
+    if output_path.exists():
+        try:
+            all_existing = load_chats_from_json(output_path)
+            # Filter out chats that are now in the keep list
+            existing_chats = [c for c in all_existing if c.get("id") not in keep_ids]
+            removed_count = len(all_existing) - len(existing_chats)
+            if removed_count > 0:
+                click.echo(f"Removed {removed_count} chats that are now in keep list")
+                # Save the filtered list back to file
+                save_chats_to_json(output_path, existing_chats)
+            existing_ids = {c.get("id") for c in existing_chats if c.get("id") is not None}
+            click.echo(f"Found {len(existing_chats)} existing chats in {output_path}")
+        except (json.JSONDecodeError, OSError):
+            click.echo(f"Warning: Could not read existing file {output_path}, starting fresh")
+
+    # Load fresh chats cache
+    fresh_cache = load_fresh_chats_cache(fresh_cache_path)
+    now = datetime.now(UTC)
+    threshold = now - timedelta(days=months * 30)
+    cached_skip_count = 0
+
+    # Filter cache to only include chats still fresh (last_message + months > now)
+    valid_cache_ids: set[int] = set()
+    for chat_id, cache_entry in fresh_cache.items():
+        last_msg_str = cache_entry.get("last_message_date")
+        if last_msg_str:
+            last_msg = datetime.fromisoformat(last_msg_str)
+            if last_msg.tzinfo is None:
+                last_msg = last_msg.replace(tzinfo=UTC)
+            # If last message is newer than threshold, chat is still fresh
+            if last_msg >= threshold:
+                valid_cache_ids.add(chat_id)
+
+    if valid_cache_ids:
+        click.echo(f"Skipping {len(valid_cache_ids)} fresh chats (last message within {months} months)")
+
     client = get_client()
     async with client:
-        click.echo(f"Fetching dialogs (looking for chats inactive for {months}+ months)...")
-        dialogs: list[Dialog] = await client.get_dialogs()  # type: ignore[assignment]
+        click.echo(f"Collecting chats inactive for {months}+ months...")
 
-        result: list[dict[str, Any]] = []
+        new_chats: list[dict[str, Any]] = []
+        fresh_chats_to_cache: dict[int, dict[str, Any]] = {}
         skipped_count = 0
-        for dialog in dialogs:
+        checked_count = 0
+
+        async for dialog in client.iter_dialogs():
+            checked_count += 1
+            entity = dialog.entity
+            chat_name = get_entity_name(entity)
+
+            # Show progress
+            click.echo(f"[{checked_count}] {chat_name}", nl=False)
+
             # Skip chats in keep list
             if dialog.id in keep_ids:
+                click.echo(" [kept]")
                 skipped_count += 1
                 continue
 
-            if not is_inactive(dialog.date, months):
+            # Skip chats already cleaned
+            if dialog.id in deleted_ids:
+                click.echo(" [cleaned]")
                 continue
 
-            entity = dialog.entity
+            # Skip chats already in existing file
+            if dialog.id in existing_ids:
+                click.echo(" [already collected]")
+                continue
+
+            # Skip chats in fresh cache not due for recheck
+            if dialog.id in valid_cache_ids:
+                click.echo(" [cached fresh]")
+                cached_skip_count += 1
+                continue
+
+            if not is_inactive(dialog.date, months):
+                click.echo(" [fresh]")
+                # Cache this fresh chat with its last message date
+                fresh_chats_to_cache[dialog.id] = {
+                    "last_message_date": format_date(dialog.date),
+                    "name": chat_name,
+                }
+                continue
+
+            click.echo(" [INACTIVE]")
+
             dialog_info: dict[str, Any] = {
                 "id": dialog.id,
-                "name": get_entity_name(entity),
+                "name": chat_name,
                 "type": get_entity_type(entity),
                 "last_message_date": format_date(dialog.date),
                 "unread_count": dialog.unread_count,
@@ -335,15 +481,30 @@ async def collect_inactive_chats(
                 dialog_info["username"] = getattr(entity, "username", None)
                 dialog_info["participants_count"] = getattr(entity, "participants_count", None)
 
-            result.append(dialog_info)
+            new_chats.append(dialog_info)
 
-            if limit is not None and len(result) >= limit:
+            if limit is not None and len(new_chats) >= limit:
+                click.echo(f" [LIMIT REACHED]")
                 break
 
+        # Update fresh cache with newly discovered fresh chats
+        if fresh_chats_to_cache:
+            fresh_cache.update(fresh_chats_to_cache)
+            save_fresh_chats_cache(fresh_cache_path, fresh_cache)
+            click.echo(f"Cached {len(fresh_chats_to_cache)} fresh chats for future runs")
+
+        # Combine existing and new chats
+        result = existing_chats + new_chats
         output_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
-        click.echo(f"Found {len(result)} inactive chats (out of {len(dialogs)} total)")
+
+        click.echo("")
+        click.echo(f"Found {len(new_chats)} new inactive chats (out of {checked_count} checked)")
+        if existing_chats:
+            click.echo(f"Combined with {len(existing_chats)} existing, total: {len(result)}")
         if skipped_count > 0:
             click.echo(f"Skipped {skipped_count} chats from keep list")
+        if cached_skip_count > 0:
+            click.echo(f"Skipped {cached_skip_count} chats from fresh cache")
         click.echo(f"Saved to {output_path}")
 
 
@@ -408,7 +569,7 @@ async def clear_messages(
                     click.echo(f"  Deleted message ID: {msg_id}")
                     await asyncio.sleep(RATE_LIMIT_DELAY)
                 except FloodWaitError as e:
-                    click.echo(f"\n  EMERGENCY STOP: Rate limit hit!")
+                    click.echo("\n  EMERGENCY STOP: Rate limit hit!")
                     click.echo(f"  Telegram requires waiting {e.seconds} seconds")
                     click.echo(f"  Deleted {deleted_count}/{len(messages_to_delete)} before stop")
                     raise FloodWaitStop(e.seconds) from e
@@ -483,10 +644,11 @@ async def clean_chats_messages(
             if not messages_to_delete:
                 click.echo("  No messages found")
                 result["chats_processed"] += 1
-                # Remove from remaining list and save
+                # Remove from remaining list, save, and add to deleted list
                 if not dry_run and file_path:
                     remaining_chats = [c for c in remaining_chats if c.get("id") != chat_id]
                     save_chats_to_json(file_path, remaining_chats)
+                    add_to_deleted_chats(chat_info)
                 continue
 
             click.echo(f"  Found {len(messages_to_delete)} messages")
@@ -505,7 +667,7 @@ async def clean_chats_messages(
                     deleted_count += 1
                     await asyncio.sleep(RATE_LIMIT_DELAY)
                 except FloodWaitError as e:
-                    click.echo(f"\n  EMERGENCY STOP: Rate limit hit!")
+                    click.echo("\n  EMERGENCY STOP: Rate limit hit!")
                     click.echo(f"  Telegram requires waiting {e.seconds} seconds")
                     click.echo(f"  Deleted {deleted_count}/{len(messages_to_delete)} in this chat")
                     result["total_deleted"] += deleted_count
@@ -527,10 +689,11 @@ async def clean_chats_messages(
             result["chats_processed"] += 1
             click.echo(f"  Deleted {deleted_count}/{len(messages_to_delete)} messages")
 
-            # Remove from remaining list and save after successful clean
+            # Remove from remaining list, save, and add to deleted list after successful clean
             if file_path:
                 remaining_chats = [c for c in remaining_chats if c.get("id") != chat_id]
                 save_chats_to_json(file_path, remaining_chats)
+                add_to_deleted_chats(chat_info)
 
     return result
 
@@ -545,7 +708,7 @@ def cli() -> None:
     "-o",
     "--output",
     type=click.Path(path_type=Path),
-    default=Path("inactive_chats.json"),
+    default=Path("chats_to_delete.json"),
     help="Output JSON file path",
 )
 @click.option(
@@ -574,7 +737,7 @@ def collect(output: Path, months: int, limit: int | None) -> None:
 @click.argument(
     "file",
     type=click.Path(exists=True, path_type=Path),
-    default=Path("inactive_chats.json"),
+    default=Path("chats_to_delete.json"),
 )
 def view(file: Path) -> None:
     """View collected chats in an interactive TUI.
@@ -594,7 +757,7 @@ def view(file: Path) -> None:
 @click.argument(
     "file",
     type=click.Path(exists=True, path_type=Path),
-    default=Path("inactive_chats.json"),
+    default=Path("chats_to_delete.json"),
 )
 @click.option(
     "--dry-run",

@@ -40,7 +40,8 @@ ENV/
 *.session-journal
 
 # Test/debug output
-inactive_chats.json
+chats_to_delete.json
+deleted_chats.json
 test_chats.json
 keep.json
 
