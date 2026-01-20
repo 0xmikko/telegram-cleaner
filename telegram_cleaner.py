@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import click
 from dotenv import load_dotenv
 from telethon import TelegramClient
-from telethon.errors import ChatAdminRequiredError, UserNotParticipantError
+from telethon.errors import ChatAdminRequiredError, FloodWaitError, UserNotParticipantError
 from telethon.tl.functions.channels import (
     EditAdminRequest,
     InviteToChannelRequest,
@@ -43,6 +43,15 @@ API_HASH = os.getenv("TG_API_HASH")
 SESSION_NAME = os.getenv("TG_SESSION_NAME", "telegram_cleaner")
 
 DEFAULT_MESSAGE_LIMIT = 100
+RATE_LIMIT_DELAY = 0.5  # seconds between API calls
+
+
+class FloodWaitStop(Exception):
+    """Raised when a FloodWaitError is encountered to trigger emergency stop."""
+
+    def __init__(self, wait_seconds: int) -> None:
+        self.wait_seconds = wait_seconds
+        super().__init__(f"Telegram rate limit hit. Required wait: {wait_seconds} seconds")
 
 
 def get_client() -> TelegramClient:
@@ -341,13 +350,24 @@ async def clear_messages(
             return
 
         click.echo("Deleting messages...")
-        for msg_id in messages_to_delete:
-            try:
-                await client.delete_messages(entity, msg_id)  # type: ignore[arg-type]
-                deleted_count += 1
-                click.echo(f"  Deleted message ID: {msg_id}")
-            except Exception as e:
-                click.echo(f"  Failed to delete message {msg_id}: {e}")
+        try:
+            for msg_id in messages_to_delete:
+                try:
+                    await client.delete_messages(entity, msg_id)  # type: ignore[arg-type]
+                    deleted_count += 1
+                    click.echo(f"  Deleted message ID: {msg_id}")
+                    await asyncio.sleep(RATE_LIMIT_DELAY)
+                except FloodWaitError as e:
+                    click.echo(f"\n  EMERGENCY STOP: Rate limit hit!")
+                    click.echo(f"  Telegram requires waiting {e.seconds} seconds")
+                    click.echo(f"  Deleted {deleted_count}/{len(messages_to_delete)} before stop")
+                    raise FloodWaitStop(e.seconds) from e
+                except Exception as e:
+                    click.echo(f"  Failed to delete message {msg_id}: {e}")
+        except FloodWaitStop:
+            click.echo("\nOperation stopped due to rate limiting.")
+            click.echo("Please wait and try again later.")
+            return
 
         click.echo(f"\nDeleted {deleted_count}/{len(messages_to_delete)} messages")
 
@@ -428,12 +448,30 @@ async def clean_chats_messages(
 
             # Delete messages
             deleted_count = 0
+            flood_stopped = False
             for msg_id in messages_to_delete:
                 try:
                     await client.delete_messages(entity, msg_id)  # type: ignore[arg-type]
                     deleted_count += 1
+                    await asyncio.sleep(RATE_LIMIT_DELAY)
+                except FloodWaitError as e:
+                    click.echo(f"\n  EMERGENCY STOP: Rate limit hit!")
+                    click.echo(f"  Telegram requires waiting {e.seconds} seconds")
+                    click.echo(f"  Deleted {deleted_count}/{len(messages_to_delete)} in this chat")
+                    result["total_deleted"] += deleted_count
+                    # Save remaining chats before stopping
+                    if file_path:
+                        save_chats_to_json(file_path, remaining_chats)
+                    result["flood_wait_seconds"] = e.seconds  # type: ignore[typeddict-unknown-key]
+                    flood_stopped = True
+                    break
                 except Exception as e:
                     click.echo(f"  Failed to delete message {msg_id}: {e}")
+
+            if flood_stopped:
+                click.echo("\nOperation stopped due to rate limiting.")
+                click.echo("Progress has been saved. Run again later to continue.")
+                return result
 
             result["total_deleted"] += deleted_count
             result["chats_processed"] += 1
@@ -521,8 +559,13 @@ async def add_admin_to_chats(
                             InviteToChannelRequest(entity, [target_user])  # type: ignore[arg-type]
                         )
                         click.echo(f"  Invited {get_entity_name(target_user)} to {chat_name}")
+                        await asyncio.sleep(RATE_LIMIT_DELAY)
                     except UserNotParticipantError:
                         pass
+                    except FloodWaitError as e:
+                        click.echo(f"\n  EMERGENCY STOP: Rate limit hit!")
+                        click.echo(f"  Telegram requires waiting {e.seconds} seconds")
+                        return
                     except Exception as e:
                         if "USER_ALREADY_PARTICIPANT" not in str(e):
                             click.echo(f"  Warning: Could not invite user: {e}")
@@ -536,6 +579,7 @@ async def add_admin_to_chats(
                         )
                     )
                     click.echo(f"  Promoted to admin in {chat_name}")
+                    await asyncio.sleep(RATE_LIMIT_DELAY)
 
                 elif isinstance(entity, Chat):
                     try:
@@ -547,6 +591,11 @@ async def add_admin_to_chats(
                             )
                         )
                         click.echo(f"  Added {get_entity_name(target_user)} to {chat_name}")
+                        await asyncio.sleep(RATE_LIMIT_DELAY)
+                    except FloodWaitError as e:
+                        click.echo(f"\n  EMERGENCY STOP: Rate limit hit!")
+                        click.echo(f"  Telegram requires waiting {e.seconds} seconds")
+                        return
                     except Exception as e:
                         if "USER_ALREADY_PARTICIPANT" not in str(e):
                             click.echo(f"  Warning: Could not add user: {e}")
@@ -558,6 +607,10 @@ async def add_admin_to_chats(
 
             except ChatAdminRequiredError:
                 click.echo(f"  Error: You don't have admin rights in {chat_name}")
+            except FloodWaitError as e:
+                click.echo(f"\n  EMERGENCY STOP: Rate limit hit!")
+                click.echo(f"  Telegram requires waiting {e.seconds} seconds")
+                return
             except Exception as e:
                 click.echo(f"  Error: {e}")
 

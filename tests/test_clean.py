@@ -7,9 +7,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from telethon.errors import FloodWaitError
 from telethon.tl.types import User
 
-from telegram_cleaner import clean_chats_messages
+from telegram_cleaner import RATE_LIMIT_DELAY, clean_chats_messages
 
 
 def create_mock_user(user_id: int, first_name: str) -> MagicMock:
@@ -259,3 +260,86 @@ class TestCleanChatsMessages:
         # JSON should be unchanged
         remaining = json.loads(json_path.read_text())
         assert len(remaining) == 1
+
+    @pytest.mark.asyncio
+    async def test_stops_on_flood_wait_error(self, tmp_path: Path) -> None:
+        """Should stop immediately when FloodWaitError is encountered."""
+        chats = [
+            {"id": 123, "name": "Chat 1"},
+            {"id": 456, "name": "Chat 2"},
+        ]
+        json_path = tmp_path / "chats.json"
+        json_path.write_text(json.dumps(chats))
+
+        mock_messages = [
+            create_mock_message(1, "msg1"),
+            create_mock_message(2, "msg2"),
+            create_mock_message(3, "msg3"),
+        ]
+
+        with patch("telegram_cleaner.get_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_me = create_mock_user(999, "Me")
+            mock_client.get_me = AsyncMock(return_value=mock_me)
+            mock_client.get_entity = AsyncMock(return_value=create_mock_user(123, "User"))
+
+            # Simulate FloodWaitError on second delete (capture param becomes seconds)
+            flood_error = FloodWaitError(request=None, capture=300)
+            mock_client.delete_messages = AsyncMock(
+                side_effect=[None, flood_error]
+            )
+
+            async def mock_iter_messages(*args, **kwargs):
+                for msg in mock_messages:
+                    yield msg
+
+            mock_client.iter_messages = mock_iter_messages
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
+
+            with patch("telegram_cleaner.asyncio.sleep", new_callable=AsyncMock):
+                result = await clean_chats_messages(chats, dry_run=False, file_path=json_path)
+
+        # Should have deleted 1 message before stopping
+        assert result["total_deleted"] == 1
+        # Should report the wait time
+        assert result.get("flood_wait_seconds") == 300
+        # Second chat should not be processed
+        assert result["chats_processed"] == 0
+
+        # Remaining chats should be saved
+        remaining = json.loads(json_path.read_text())
+        assert len(remaining) == 2
+
+    @pytest.mark.asyncio
+    async def test_rate_limiting_delay_between_deletes(self) -> None:
+        """Should have delay between delete operations."""
+        chats = [{"id": 123, "name": "Chat 1"}]
+        mock_messages = [
+            create_mock_message(1, "msg1"),
+            create_mock_message(2, "msg2"),
+        ]
+
+        with patch("telegram_cleaner.get_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_me = create_mock_user(999, "Me")
+            mock_client.get_me = AsyncMock(return_value=mock_me)
+            mock_client.get_entity = AsyncMock(return_value=create_mock_user(123, "User"))
+            mock_client.delete_messages = AsyncMock()
+
+            async def mock_iter_messages(*args, **kwargs):
+                for msg in mock_messages:
+                    yield msg
+
+            mock_client.iter_messages = mock_iter_messages
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
+
+            with patch("telegram_cleaner.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+                await clean_chats_messages(chats, dry_run=False)
+
+                # Should have called sleep after each delete
+                assert mock_sleep.call_count == 2
+                mock_sleep.assert_called_with(RATE_LIMIT_DELAY)
