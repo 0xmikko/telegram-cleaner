@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from telegram_cleaner import load_chats_from_json, save_chats_to_json
+from telegram_cleaner import (
+    add_to_keep_list,
+    load_chats_from_json,
+    load_keep_list,
+    save_chats_to_json,
+)
 
 
 class TestLoadChatsFromJson:
@@ -90,3 +95,106 @@ class TestSaveChatsToJson:
 
         result = json.loads(json_path.read_text())
         assert result == []
+
+
+class TestLoadKeepList:
+    """Tests for the load_keep_list function."""
+
+    def test_returns_empty_set_for_missing_file(self, tmp_path: Path):
+        """Should return empty set if keep file doesn't exist."""
+        keep_path = tmp_path / "keep.json"
+
+        result = load_keep_list(keep_path)
+
+        assert result == set()
+
+    def test_loads_ids_from_existing_file(self, tmp_path: Path):
+        """Should load chat IDs from existing keep file."""
+        keep_path = tmp_path / "keep.json"
+        data = [
+            {"id": 123, "name": "Chat 1"},
+            {"id": 456, "name": "Chat 2"},
+        ]
+        keep_path.write_text(json.dumps(data))
+
+        result = load_keep_list(keep_path)
+
+        assert result == {123, 456}
+
+    def test_handles_invalid_json(self, tmp_path: Path):
+        """Should return empty set for invalid JSON."""
+        keep_path = tmp_path / "keep.json"
+        keep_path.write_text("invalid json {")
+
+        result = load_keep_list(keep_path)
+
+        assert result == set()
+
+    def test_skips_entries_without_id(self, tmp_path: Path):
+        """Should skip entries that don't have an id field."""
+        keep_path = tmp_path / "keep.json"
+        data = [
+            {"id": 123, "name": "Chat 1"},
+            {"name": "Chat without ID"},
+            {"id": 456, "name": "Chat 2"},
+        ]
+        keep_path.write_text(json.dumps(data))
+
+        result = load_keep_list(keep_path)
+
+        assert result == {123, 456}
+
+
+class TestAddToKeepList:
+    """Tests for the add_to_keep_list function."""
+
+    def test_creates_file_if_not_exists(self, tmp_path: Path):
+        """Should create keep file if it doesn't exist."""
+        keep_path = tmp_path / "keep.json"
+        chat = {"id": 123, "name": "Test Chat"}
+
+        add_to_keep_list(chat, keep_path)
+
+        assert keep_path.exists()
+        result = json.loads(keep_path.read_text())
+        assert len(result) == 1
+        assert result[0]["id"] == 123
+
+    def test_appends_to_existing_file(self, tmp_path: Path):
+        """Should append chat to existing keep file."""
+        keep_path = tmp_path / "keep.json"
+        existing = [{"id": 100, "name": "Existing"}]
+        keep_path.write_text(json.dumps(existing))
+
+        chat = {"id": 123, "name": "New Chat"}
+        add_to_keep_list(chat, keep_path)
+
+        result = json.loads(keep_path.read_text())
+        assert len(result) == 2
+        assert result[0]["id"] == 100
+        assert result[1]["id"] == 123
+
+    def test_does_not_add_duplicate(self, tmp_path: Path):
+        """Should not add chat if ID already exists in keep list."""
+        keep_path = tmp_path / "keep.json"
+        existing = [{"id": 123, "name": "Existing"}]
+        keep_path.write_text(json.dumps(existing))
+
+        chat = {"id": 123, "name": "Duplicate"}
+        add_to_keep_list(chat, keep_path)
+
+        result = json.loads(keep_path.read_text())
+        assert len(result) == 1
+        assert result[0]["name"] == "Existing"
+
+    def test_handles_corrupted_file(self, tmp_path: Path):
+        """Should handle corrupted keep file gracefully."""
+        keep_path = tmp_path / "keep.json"
+        keep_path.write_text("corrupted {")
+
+        chat = {"id": 123, "name": "New Chat"}
+        add_to_keep_list(chat, keep_path)
+
+        result = json.loads(keep_path.read_text())
+        assert len(result) == 1
+        assert result[0]["id"] == 123

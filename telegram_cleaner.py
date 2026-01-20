@@ -36,6 +36,7 @@ SESSION_NAME = os.getenv("TG_SESSION_NAME", "telegram_cleaner")
 
 DEFAULT_MESSAGE_LIMIT = 100
 RATE_LIMIT_DELAY = 0.5  # seconds between API calls
+KEEP_FILE = Path("keep.json")  # Chats to skip during collect
 
 
 class FloodWaitStop(Exception):
@@ -127,6 +128,48 @@ def save_chats_to_json(file_path: Path, chats: list[dict[str, Any]]) -> None:
     file_path.write_text(json.dumps(chats, indent=2, ensure_ascii=False))
 
 
+def load_keep_list(keep_file: Path = KEEP_FILE) -> set[int]:
+    """Load the set of chat IDs to keep (skip during collect).
+
+    Args:
+        keep_file: Path to the keep list JSON file.
+
+    Returns:
+        Set of chat IDs that should be skipped.
+    """
+    if not keep_file.exists():
+        return set()
+    try:
+        with keep_file.open() as f:
+            chats = json.load(f)
+            return {chat.get("id") for chat in chats if chat.get("id") is not None}
+    except (json.JSONDecodeError, OSError):
+        return set()
+
+
+def add_to_keep_list(chat: dict[str, Any], keep_file: Path = KEEP_FILE) -> None:
+    """Add a chat to the keep list.
+
+    Args:
+        chat: Chat dictionary to add to the keep list.
+        keep_file: Path to the keep list JSON file.
+    """
+    # Load existing keep list
+    existing: list[dict[str, Any]] = []
+    if keep_file.exists():
+        try:
+            with keep_file.open() as f:
+                existing = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            existing = []
+
+    # Check if already in list
+    existing_ids = {c.get("id") for c in existing}
+    if chat.get("id") not in existing_ids:
+        existing.append(chat)
+        keep_file.write_text(json.dumps(existing, indent=2, ensure_ascii=False))
+
+
 class ChatsViewerApp(App[None]):
     """TUI app to view and navigate chats."""
 
@@ -136,7 +179,8 @@ class ChatsViewerApp(App[None]):
         ("q", "quit", "Quit"),
         ("j", "cursor_down", "Down"),
         ("k", "cursor_up", "Up"),
-        ("d", "remove_chat", "Remove"),
+        ("d", "remove_chat", "Delete"),
+        ("s", "keep_chat", "Keep"),
     ]
 
     def __init__(self, chats: list[dict[str, Any]], file_path: Path) -> None:
@@ -209,6 +253,38 @@ class ChatsViewerApp(App[None]):
         # Notify user
         self.notify(f"Removed: {chat_name}")
 
+    def action_keep_chat(self) -> None:
+        """Mark the selected chat to keep (skip in future collects) and remove from list."""
+        table = self.query_one(DataTable)
+        if table.row_count == 0:
+            self.notify("No chats to keep", severity="warning")
+            return
+
+        # Get current cursor row index
+        row_index = table.cursor_row
+        if row_index is None or row_index < 0 or row_index >= len(self.chats):
+            self.notify("No chat selected", severity="warning")
+            return
+
+        # Get the chat data
+        chat = self.chats[row_index]
+        chat_name = chat.get("name", "Unknown")
+
+        # Add to keep list
+        add_to_keep_list(chat)
+
+        # Remove from our data
+        del self.chats[row_index]
+
+        # Save to file
+        save_chats_to_json(self.file_path, self.chats)
+
+        # Refresh the table
+        self._refresh_table()
+
+        # Notify user
+        self.notify(f"Keeping: {chat_name}")
+
 
 async def collect_inactive_chats(
     output_path: Path,
@@ -222,13 +298,24 @@ async def collect_inactive_chats(
         months: Number of months of inactivity threshold.
         limit: Maximum number of inactive chats to collect (None for unlimited).
     """
+    # Load keep list to skip
+    keep_ids = load_keep_list()
+    if keep_ids:
+        click.echo(f"Skipping {len(keep_ids)} chats from keep list")
+
     client = get_client()
     async with client:
         click.echo(f"Fetching dialogs (looking for chats inactive for {months}+ months)...")
         dialogs: list[Dialog] = await client.get_dialogs()  # type: ignore[assignment]
 
         result: list[dict[str, Any]] = []
+        skipped_count = 0
         for dialog in dialogs:
+            # Skip chats in keep list
+            if dialog.id in keep_ids:
+                skipped_count += 1
+                continue
+
             if not is_inactive(dialog.date, months):
                 continue
 
@@ -255,6 +342,8 @@ async def collect_inactive_chats(
 
         output_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
         click.echo(f"Found {len(result)} inactive chats (out of {len(dialogs)} total)")
+        if skipped_count > 0:
+            click.echo(f"Skipped {skipped_count} chats from keep list")
         click.echo(f"Saved to {output_path}")
 
 

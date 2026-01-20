@@ -42,6 +42,7 @@ ENV/
 # Test/debug output
 inactive_chats.json
 test_chats.json
+keep.json
 
 # uv
 .uv/

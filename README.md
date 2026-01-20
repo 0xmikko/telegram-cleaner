@@ -6,6 +6,7 @@ A CLI tool for cleaning up your Telegram message history. Features an interactiv
 
 - **Collect inactive chats** - Find chats with no activity for X months
 - **Interactive TUI** - Review and manage collected chats with vim-style navigation
+- **Keep list** - Mark chats to skip permanently in future collects
 - **Bulk message cleanup** - Delete your messages from multiple chats at once
 - **Single chat cleanup** - Clear your messages from a specific chat
 
@@ -86,10 +87,12 @@ uv run python telegram_cleaner.py view my_chats.json
 |-----|--------|
 | `j` / `↓` | Move cursor down |
 | `k` / `↑` | Move cursor up |
-| `d` | Remove selected chat from list |
+| `d` | Delete - remove chat from list (will be cleaned) |
+| `s` | Skip - keep chat permanently (skip in future collects) |
 | `q` | Quit |
 
-Removing a chat from the list (with `d`) saves the file automatically. This lets you curate the list before running the `clean` command.
+- **`d` (Delete)** - Removes the chat from the current list. Use this when you want to clean messages from this chat.
+- **`s` (Skip)** - Adds the chat to `keep.json` and removes from current list. These chats will be automatically skipped in future `collect` runs. Use this for chats you want to preserve.
 
 #### `clean` - Bulk delete your messages
 
@@ -134,7 +137,8 @@ Options:
    ```bash
    uv run python telegram_cleaner.py view inactive_chats.json
    ```
-   Use `d` to remove chats you want to keep.
+   - Press `s` to mark chats you want to **keep** (they'll be skipped in future collects)
+   - Press `d` to remove chats from the list (they stay for cleaning)
 
 3. **Preview the cleanup:**
    ```bash
