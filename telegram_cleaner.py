@@ -13,16 +13,10 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import click
 from dotenv import load_dotenv
 from telethon import TelegramClient
-from telethon.errors import ChatAdminRequiredError, FloodWaitError, UserNotParticipantError
-from telethon.tl.functions.channels import (
-    EditAdminRequest,
-    InviteToChannelRequest,
-)
-from telethon.tl.functions.messages import AddChatUserRequest
+from telethon.errors import FloodWaitError
 from telethon.tl.types import (
     Channel,
     Chat,
-    ChatAdminRights,
     Dialog,
     User,
 )
@@ -30,8 +24,6 @@ from textual.app import App, ComposeResult
 from textual.widgets import DataTable, Footer, Header
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     from textual.binding import BindingType
 
 from datetime import UTC, datetime, timedelta
@@ -266,37 +258,6 @@ async def collect_inactive_chats(
         click.echo(f"Saved to {output_path}")
 
 
-async def store_dialogs(output_path: Path) -> None:
-    """Store all DMs and chats to a JSON file."""
-    client = get_client()
-    async with client:
-        click.echo("Fetching dialogs...")
-        dialogs: list[Dialog] = await client.get_dialogs()  # type: ignore[assignment]
-
-        result: list[dict[str, Any]] = []
-        for dialog in dialogs:
-            entity = dialog.entity
-            dialog_info: dict[str, Any] = {
-                "id": dialog.id,
-                "name": get_entity_name(entity),
-                "type": get_entity_type(entity),
-                "last_message_date": format_date(dialog.date),
-                "unread_count": dialog.unread_count,
-            }
-
-            if isinstance(entity, User):
-                dialog_info["username"] = entity.username
-                dialog_info["phone"] = entity.phone
-            elif isinstance(entity, (Chat, Channel)):
-                dialog_info["username"] = getattr(entity, "username", None)
-                dialog_info["participants_count"] = getattr(entity, "participants_count", None)
-
-            result.append(dialog_info)
-
-        output_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
-        click.echo(f"Stored {len(result)} dialogs to {output_path}")
-
-
 async def clear_messages(
     chat_identifier: str,
     limit: int,
@@ -485,154 +446,9 @@ async def clean_chats_messages(
     return result
 
 
-async def add_admin_to_chats(
-    chat_ids: Sequence[str],
-    user_to_add: str,
-    dry_run: bool,
-) -> None:
-    """Add a user to chats and make them admin."""
-    client = get_client()
-    async with client:
-        click.echo(f"Resolving user: {user_to_add}")
-        try:
-            target_user = await client.get_entity(user_to_add)
-        except ValueError:
-            try:
-                target_user = await client.get_entity(int(user_to_add))
-            except (ValueError, TypeError):
-                click.echo(f"Error: Could not find user '{user_to_add}'")
-                return
-
-        if not isinstance(target_user, User):
-            click.echo("Error: Target must be a user, not a chat or channel")
-            return
-
-        click.echo(f"Target user: {get_entity_name(target_user)}")
-        if dry_run:
-            click.echo("DRY RUN - No changes will be made")
-
-        admin_rights = ChatAdminRights(
-            change_info=True,
-            post_messages=True,
-            edit_messages=True,
-            delete_messages=True,
-            ban_users=True,
-            invite_users=True,
-            pin_messages=True,
-            add_admins=False,
-            manage_call=True,
-            anonymous=False,
-            manage_topics=True,
-            other=True,
-        )
-
-        for chat_id in chat_ids:
-            click.echo(f"\nProcessing chat: {chat_id}")
-            try:
-                entity = await client.get_entity(chat_id)
-            except ValueError:
-                try:
-                    entity = await client.get_entity(int(chat_id))
-                except (ValueError, TypeError):
-                    click.echo(f"  Error: Could not find chat '{chat_id}'")
-                    continue
-
-            if not isinstance(entity, (User, Chat, Channel)):
-                click.echo(f"  Error: Unexpected entity type for '{chat_id}'")
-                continue
-
-            chat_name = get_entity_name(entity)
-            click.echo(f"  Chat name: {chat_name}")
-
-            if isinstance(entity, User):
-                click.echo("  Skipping: This is a user, not a chat")
-                continue
-
-            if dry_run:
-                click.echo("  Would add user and promote to admin")
-                continue
-
-            try:
-                if isinstance(entity, Channel):
-                    try:
-                        await client(
-                            InviteToChannelRequest(entity, [target_user])  # type: ignore[arg-type]
-                        )
-                        click.echo(f"  Invited {get_entity_name(target_user)} to {chat_name}")
-                        await asyncio.sleep(RATE_LIMIT_DELAY)
-                    except UserNotParticipantError:
-                        pass
-                    except FloodWaitError as e:
-                        click.echo(f"\n  EMERGENCY STOP: Rate limit hit!")
-                        click.echo(f"  Telegram requires waiting {e.seconds} seconds")
-                        return
-                    except Exception as e:
-                        if "USER_ALREADY_PARTICIPANT" not in str(e):
-                            click.echo(f"  Warning: Could not invite user: {e}")
-
-                    await client(
-                        EditAdminRequest(
-                            channel=entity,  # type: ignore[arg-type]
-                            user_id=target_user,  # type: ignore[arg-type]
-                            admin_rights=admin_rights,
-                            rank="Admin",
-                        )
-                    )
-                    click.echo(f"  Promoted to admin in {chat_name}")
-                    await asyncio.sleep(RATE_LIMIT_DELAY)
-
-                elif isinstance(entity, Chat):
-                    try:
-                        await client(
-                            AddChatUserRequest(
-                                chat_id=entity.id,
-                                user_id=target_user,  # type: ignore[arg-type]
-                                fwd_limit=0,
-                            )
-                        )
-                        click.echo(f"  Added {get_entity_name(target_user)} to {chat_name}")
-                        await asyncio.sleep(RATE_LIMIT_DELAY)
-                    except FloodWaitError as e:
-                        click.echo(f"\n  EMERGENCY STOP: Rate limit hit!")
-                        click.echo(f"  Telegram requires waiting {e.seconds} seconds")
-                        return
-                    except Exception as e:
-                        if "USER_ALREADY_PARTICIPANT" not in str(e):
-                            click.echo(f"  Warning: Could not add user: {e}")
-
-                    click.echo(
-                        f"  Note: Basic groups don't support programmatic admin promotion. "
-                        f"Please promote manually in {chat_name}"
-                    )
-
-            except ChatAdminRequiredError:
-                click.echo(f"  Error: You don't have admin rights in {chat_name}")
-            except FloodWaitError as e:
-                click.echo(f"\n  EMERGENCY STOP: Rate limit hit!")
-                click.echo(f"  Telegram requires waiting {e.seconds} seconds")
-                return
-            except Exception as e:
-                click.echo(f"  Error: {e}")
-
-        click.echo("\nDone!")
-
-
 @click.group()
 def cli() -> None:
-    """Telegram Cleaner - Manage your Telegram DMs, chats, and admin operations."""
-
-
-@cli.command()
-@click.option(
-    "-o",
-    "--output",
-    type=click.Path(path_type=Path),
-    default=Path("dialogs.json"),
-    help="Output JSON file path",
-)
-def store(output: Path) -> None:
-    """Store all DMs and chats to a JSON file with names and last contact dates."""
-    asyncio.run(store_dialogs(output))
+    """Telegram Cleaner - Manage your Telegram DMs and chats."""
 
 
 @cli.command()
@@ -748,23 +564,6 @@ def clear(chat: str, limit: int, dry_run: bool) -> None:
     CHAT can be a username, phone number, or chat ID.
     """
     asyncio.run(clear_messages(chat, limit, dry_run))
-
-
-@cli.command("add-admin")
-@click.argument("user")
-@click.argument("chats", nargs=-1, required=True)
-@click.option(
-    "--dry-run",
-    is_flag=True,
-    help="Show what would be done without making changes",
-)
-def add_admin(user: str, chats: tuple[str, ...], dry_run: bool) -> None:
-    """Add a user to chats and make them admin.
-
-    USER is the username or ID of the user to add.
-    CHATS are the usernames or IDs of chats where you are admin.
-    """
-    asyncio.run(add_admin_to_chats(chats, user, dry_run))
 
 
 if __name__ == "__main__":

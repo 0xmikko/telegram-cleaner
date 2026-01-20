@@ -1,15 +1,13 @@
 # Telegram Cleaner
 
-A CLI tool for managing Telegram DMs, chats, and admin operations. Features an interactive TUI for reviewing chats and bulk operations for cleaning up your message history.
+A CLI tool for cleaning up your Telegram message history. Features an interactive TUI for reviewing chats and bulk operations for deleting your messages from inactive conversations.
 
 ## Features
 
-- **Store dialogs** - Export all your DMs and chats to JSON with metadata
 - **Collect inactive chats** - Find chats with no activity for X months
 - **Interactive TUI** - Review and manage collected chats with vim-style navigation
 - **Bulk message cleanup** - Delete your messages from multiple chats at once
 - **Single chat cleanup** - Clear your messages from a specific chat
-- **Admin management** - Add users as admins to multiple chats
 
 ## Requirements
 
@@ -58,18 +56,6 @@ uv run python telegram_cleaner.py <command> [options]
 ```
 
 ### Commands
-
-#### `store` - Export all dialogs
-
-Store all your DMs and chats to a JSON file:
-
-```bash
-uv run python telegram_cleaner.py store
-uv run python telegram_cleaner.py store -o my_dialogs.json
-```
-
-Options:
-- `-o, --output PATH` - Output file path (default: `dialogs.json`)
 
 #### `collect` - Find inactive chats
 
@@ -136,24 +122,6 @@ Arguments:
 Options:
 - `-l, --limit INT` - Maximum messages to delete (default: 100)
 - `--dry-run` - Preview without deleting
-
-#### `add-admin` - Add admin to chats
-
-Add a user to multiple chats and promote them to admin:
-
-```bash
-uv run python telegram_cleaner.py add-admin @newadmin @chat1 @chat2
-uv run python telegram_cleaner.py add-admin @user 123456 789012 --dry-run
-```
-
-Arguments:
-- `USER` - Username or ID of the user to promote
-- `CHATS` - One or more chat usernames or IDs
-
-Options:
-- `--dry-run` - Preview without making changes
-
-**Note:** You must be an admin in the target chats. Basic groups don't support programmatic admin promotion.
 
 ## Typical Workflow
 
