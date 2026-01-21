@@ -16,7 +16,9 @@ from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 from telethon.tl.types import (
     Channel,
+    ChannelForbidden,
     Chat,
+    ChatForbidden,
     User,
 )
 from textual.app import App, ComposeResult
@@ -63,22 +65,26 @@ def format_date(date: datetime | None) -> str:
     return date.isoformat()
 
 
-def get_entity_name(entity: User | Chat | Channel) -> str:
+def get_entity_name(entity: User | Chat | Channel | ChatForbidden | ChannelForbidden) -> str:
     """Extract the display name from a Telegram entity."""
     if isinstance(entity, User):
         parts = [entity.first_name or "", entity.last_name or ""]
         name = " ".join(p for p in parts if p).strip()
         return name or entity.username or str(entity.id)
+    if isinstance(entity, (ChatForbidden, ChannelForbidden)):
+        return getattr(entity, "title", None) or f"Forbidden:{entity.id}"
     # entity is Chat or Channel
     return entity.title or str(entity.id)
 
 
-def get_entity_type(entity: User | Chat | Channel) -> str:
+def get_entity_type(entity: User | Chat | Channel | ChatForbidden | ChannelForbidden) -> str:
     """Determine the type of Telegram entity."""
     if isinstance(entity, User):
         return "user" if not entity.bot else "bot"
-    if isinstance(entity, Chat):
+    if isinstance(entity, (Chat, ChatForbidden)):
         return "group"
+    if isinstance(entity, ChannelForbidden):
+        return "channel"  # Can't tell if it's a channel or supergroup
     # entity is Channel
     return "channel" if entity.broadcast else "supergroup"
 
@@ -794,6 +800,14 @@ def clean(file: Path, dry_run: bool) -> None:
         click.echo(f"  Messages deleted: {result['total_deleted']}")
     if result["errors"] > 0:
         click.echo(f"  Errors: {result['errors']}")
+
+    # Clear deleted_chats.json when all chats have been processed
+    if not dry_run:
+        remaining = load_chats_from_json(file) if file.exists() else []
+        if not remaining:
+            if DELETED_CHATS_FILE.exists():
+                DELETED_CHATS_FILE.unlink()
+                click.echo("  Cleared deleted_chats.json (all chats processed)")
 
 
 @cli.command()
