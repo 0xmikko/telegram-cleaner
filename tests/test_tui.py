@@ -11,6 +11,7 @@ from telegram_cleaner import (
     add_to_keep_list,
     load_chats_from_json,
     load_keep_list,
+    remove_from_keep_list,
     save_chats_to_json,
 )
 
@@ -198,3 +199,65 @@ class TestAddToKeepList:
         result = json.loads(keep_path.read_text())
         assert len(result) == 1
         assert result[0]["id"] == 123
+
+
+class TestRemoveFromKeepList:
+    """Tests for the remove_from_keep_list function."""
+
+    def test_removes_chat_by_id(self, tmp_path: Path):
+        """Should remove chat with matching ID from keep list."""
+        keep_path = tmp_path / "keep.json"
+        data = [
+            {"id": 123, "name": "Chat 1"},
+            {"id": 456, "name": "Chat 2"},
+            {"id": 789, "name": "Chat 3"},
+        ]
+        keep_path.write_text(json.dumps(data))
+
+        remove_from_keep_list(456, keep_path)
+
+        result = json.loads(keep_path.read_text())
+        assert len(result) == 2
+        assert result[0]["id"] == 123
+        assert result[1]["id"] == 789
+
+    def test_does_nothing_if_id_not_found(self, tmp_path: Path):
+        """Should not modify file if ID is not in keep list."""
+        keep_path = tmp_path / "keep.json"
+        data = [{"id": 123, "name": "Chat 1"}]
+        keep_path.write_text(json.dumps(data))
+
+        remove_from_keep_list(999, keep_path)
+
+        result = json.loads(keep_path.read_text())
+        assert len(result) == 1
+        assert result[0]["id"] == 123
+
+    def test_handles_missing_file(self, tmp_path: Path):
+        """Should not raise error if file doesn't exist."""
+        keep_path = tmp_path / "keep.json"
+
+        remove_from_keep_list(123, keep_path)
+
+        assert not keep_path.exists()
+
+    def test_handles_empty_file(self, tmp_path: Path):
+        """Should handle empty keep list."""
+        keep_path = tmp_path / "keep.json"
+        keep_path.write_text("[]")
+
+        remove_from_keep_list(123, keep_path)
+
+        result = json.loads(keep_path.read_text())
+        assert result == []
+
+    def test_removes_last_chat(self, tmp_path: Path):
+        """Should handle removing the only chat in list."""
+        keep_path = tmp_path / "keep.json"
+        data = [{"id": 123, "name": "Only Chat"}]
+        keep_path.write_text(json.dumps(data))
+
+        remove_from_keep_list(123, keep_path)
+
+        result = json.loads(keep_path.read_text())
+        assert result == []

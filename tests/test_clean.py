@@ -7,10 +7,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from click.testing import CliRunner
 from telethon.errors import FloodWaitError
 from telethon.tl.types import User
 
-from telegram_cleaner import RATE_LIMIT_DELAY, clean_chats_messages
+from telegram_cleaner import DELETED_CHATS_FILE, RATE_LIMIT_DELAY, clean_chats_messages, cli
 
 
 def create_mock_user(user_id: int, first_name: str) -> MagicMock:
@@ -343,3 +344,139 @@ class TestCleanChatsMessages:
                 # Should have called sleep after each delete
                 assert mock_sleep.call_count == 2
                 mock_sleep.assert_called_with(RATE_LIMIT_DELAY)
+
+
+class TestCleanCommand:
+    """Tests for the clean CLI command."""
+
+    def test_clears_deleted_chats_json_when_all_processed(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Should clear deleted_chats.json when all chats are successfully processed."""
+        # Change to tmp_path so file operations work there
+        monkeypatch.chdir(tmp_path)
+
+        # Create chats_to_delete.json with one chat
+        chats = [{"id": 123, "name": "Chat 1"}]
+        chats_file = tmp_path / "chats_to_delete.json"
+        chats_file.write_text(json.dumps(chats))
+
+        # Create deleted_chats.json with an old entry
+        deleted_file = tmp_path / "deleted_chats.json"
+        deleted_file.write_text(json.dumps([{"id": 999, "name": "Old Chat"}]))
+
+        # Patch DELETED_CHATS_FILE to point to tmp_path
+        monkeypatch.setattr("telegram_cleaner.DELETED_CHATS_FILE", deleted_file)
+
+        with patch("telegram_cleaner.get_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_me = create_mock_user(999, "Me")
+            mock_client.get_me = AsyncMock(return_value=mock_me)
+            mock_client.get_entity = AsyncMock(return_value=create_mock_user(123, "User"))
+            mock_client.delete_messages = AsyncMock()
+
+            async def mock_iter_messages(*args, **kwargs):  # noqa: ANN002, ANN003, ARG001
+                for msg in [create_mock_message(1, "msg1")]:
+                    yield msg
+
+            mock_client.iter_messages = mock_iter_messages
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
+
+            with patch("telegram_cleaner.asyncio.sleep", new_callable=AsyncMock):
+                runner = CliRunner()
+                result = runner.invoke(cli, ["clean", str(chats_file)])
+
+        assert result.exit_code == 0
+        # chats_to_delete.json should be empty
+        assert json.loads(chats_file.read_text()) == []
+        # deleted_chats.json should be removed
+        assert not deleted_file.exists()
+        assert "Cleared deleted_chats.json" in result.output
+
+    def test_keeps_deleted_chats_json_when_chats_remain(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Should NOT clear deleted_chats.json when some chats failed to process."""
+        monkeypatch.chdir(tmp_path)
+
+        # Create chats with one that will fail
+        chats = [
+            {"id": 123, "name": "Bad Chat"},
+            {"id": 456, "name": "Good Chat"},
+        ]
+        chats_file = tmp_path / "chats_to_delete.json"
+        chats_file.write_text(json.dumps(chats))
+
+        # Create deleted_chats.json
+        deleted_file = tmp_path / "deleted_chats.json"
+        deleted_file.write_text(json.dumps([]))
+
+        monkeypatch.setattr("telegram_cleaner.DELETED_CHATS_FILE", deleted_file)
+
+        with patch("telegram_cleaner.get_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_me = create_mock_user(999, "Me")
+            mock_client.get_me = AsyncMock(return_value=mock_me)
+            # First chat fails, second succeeds
+            mock_client.get_entity = AsyncMock(
+                side_effect=[ValueError("Not found"), create_mock_user(456, "User")]
+            )
+            mock_client.delete_messages = AsyncMock()
+
+            async def mock_iter_messages(*args, **kwargs):  # noqa: ANN002, ANN003, ARG001
+                for msg in [create_mock_message(1, "msg1")]:
+                    yield msg
+
+            mock_client.iter_messages = mock_iter_messages
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
+
+            with patch("telegram_cleaner.asyncio.sleep", new_callable=AsyncMock):
+                runner = CliRunner()
+                result = runner.invoke(cli, ["clean", str(chats_file)])
+
+        assert result.exit_code == 0
+        # Failed chat should remain in file
+        remaining = json.loads(chats_file.read_text())
+        assert len(remaining) == 1
+        assert remaining[0]["id"] == 123
+        # deleted_chats.json should still exist (not cleared because chats remain)
+        assert deleted_file.exists()
+        assert "Cleared deleted_chats.json" not in result.output
+
+    def test_dry_run_does_not_clear_deleted_chats(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Should NOT clear deleted_chats.json during dry run."""
+        monkeypatch.chdir(tmp_path)
+
+        chats = [{"id": 123, "name": "Chat 1"}]
+        chats_file = tmp_path / "chats_to_delete.json"
+        chats_file.write_text(json.dumps(chats))
+
+        deleted_file = tmp_path / "deleted_chats.json"
+        deleted_file.write_text(json.dumps([{"id": 999, "name": "Old Chat"}]))
+
+        monkeypatch.setattr("telegram_cleaner.DELETED_CHATS_FILE", deleted_file)
+
+        with patch("telegram_cleaner.get_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_me = create_mock_user(999, "Me")
+            mock_client.get_me = AsyncMock(return_value=mock_me)
+            mock_client.get_entity = AsyncMock(return_value=create_mock_user(123, "User"))
+
+            async def mock_iter_messages(*args, **kwargs):  # noqa: ANN002, ANN003, ARG001
+                for msg in [create_mock_message(1, "msg1")]:
+                    yield msg
+
+            mock_client.iter_messages = mock_iter_messages
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
+
+            runner = CliRunner()
+            result = runner.invoke(cli, ["clean", str(chats_file), "--dry-run"])
+
+        assert result.exit_code == 0
+        # deleted_chats.json should still exist with original content
+        assert deleted_file.exists()
+        deleted_content = json.loads(deleted_file.read_text())
+        assert len(deleted_content) == 1
+        assert deleted_content[0]["id"] == 999

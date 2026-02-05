@@ -13,7 +13,8 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import click
 from dotenv import load_dotenv
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, SearchQueryEmptyError
+from telethon.tl.functions.contacts import SearchRequest
 from telethon.tl.types import (
     Channel,
     ChannelForbidden,
@@ -175,6 +176,26 @@ def add_to_keep_list(chat: dict[str, Any], keep_file: Path = KEEP_FILE) -> None:
     if chat.get("id") not in existing_ids:
         existing.append(chat)
         keep_file.write_text(json.dumps(existing, indent=2, ensure_ascii=False))
+
+
+def remove_from_keep_list(chat_id: int, keep_file: Path = KEEP_FILE) -> None:
+    """Remove a chat from the keep list by ID.
+
+    Args:
+        chat_id: The ID of the chat to remove.
+        keep_file: Path to the keep list JSON file.
+    """
+    if not keep_file.exists():
+        return
+
+    try:
+        with keep_file.open() as f:
+            existing: list[dict[str, Any]] = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return
+
+    filtered = [c for c in existing if c.get("id") != chat_id]
+    keep_file.write_text(json.dumps(filtered, indent=2, ensure_ascii=False))
 
 
 def load_deleted_chats(deleted_file: Path = DELETED_CHATS_FILE) -> set[int]:
@@ -357,6 +378,95 @@ class ChatsViewerApp(App[None]):
         self.notify(f"Kept: {chat_name}")
 
 
+class KeepListViewerApp(App[None]):
+    """TUI app to view and manage the keep list."""
+
+    TITLE = "Telegram Cleaner - Keep List"
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        ("q", "quit", "Quit"),
+        ("j", "cursor_down", "Down"),
+        ("k", "cursor_up", "Up"),
+        ("x", "remove_chat", "Remove"),
+    ]
+
+    def __init__(self, chats: list[dict[str, Any]], file_path: Path) -> None:
+        super().__init__()
+        self.chats = chats
+        self.file_path = file_path
+        self.row_keys: list[Any] = []
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield DataTable()
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one(DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+
+        table.add_columns("Name", "Type", "Last Message")
+        self._refresh_table()
+
+    def _refresh_table(self, cursor_row: int | None = None) -> None:
+        """Refresh the table with current chats data."""
+        table = self.query_one(DataTable)
+        table.clear()
+        self.row_keys = []
+
+        for chat in self.chats:
+            name = chat.get("name", "Unknown")
+            chat_type = chat.get("type", "unknown")
+            last_date = chat.get("last_message_date", "")
+            if last_date:
+                last_date = last_date[:10]
+            row_key = table.add_row(name, chat_type, last_date)
+            self.row_keys.append(row_key)
+
+        if cursor_row is not None and self.chats:
+            new_row = min(cursor_row, len(self.chats) - 1)
+            table.move_cursor(row=new_row)
+
+    def action_cursor_down(self) -> None:
+        table = self.query_one(DataTable)
+        table.action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        table = self.query_one(DataTable)
+        table.action_cursor_up()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Handle Enter key on a row - remove the chat from keep list."""
+        self.action_remove_chat()
+
+    def action_remove_chat(self) -> None:
+        """Remove the selected chat from the keep list."""
+        table = self.query_one(DataTable)
+        if table.row_count == 0:
+            self.notify("No chats to remove", severity="warning")
+            return
+
+        row_index = table.cursor_row
+        if row_index is None or row_index < 0 or row_index >= len(self.chats):
+            self.notify("No chat selected", severity="warning")
+            return
+
+        row_key = self.row_keys[row_index]
+        chat = self.chats[row_index]
+        chat_name = chat.get("name", "Unknown")
+        chat_id = chat.get("id")
+
+        if chat_id is not None:
+            remove_from_keep_list(chat_id, self.file_path)
+
+        del self.chats[row_index]
+        del self.row_keys[row_index]
+        table.remove_row(row_key)
+
+        self.notify(f"Removed: {chat_name}")
+
+
 async def collect_inactive_chats(
     output_path: Path,
     months: int,
@@ -512,6 +622,103 @@ async def collect_inactive_chats(
         if cached_skip_count > 0:
             click.echo(f"Skipped {cached_skip_count} chats from fresh cache")
         click.echo(f"Saved to {output_path}")
+
+
+async def collect_legacy_chats(
+    output_path: Path,
+    search_letters: str = "abcdefghijklmnopqrstuvwxyz0123456789",
+) -> None:
+    """Find legacy chats not visible in dialogs by searching with each letter.
+
+    Some old Telegram chats (before ~2021) don't appear in the normal dialog list
+    but can be found via the contacts search API. This function searches with each
+    letter a-z and 0-9 to find these hidden chats.
+
+    Args:
+        output_path: Path to write the JSON output.
+        search_letters: Characters to search with (default: a-z and 0-9).
+    """
+    keep_ids = load_keep_list()
+    if keep_ids:
+        click.echo(f"Will skip {len(keep_ids)} chats from keep list")
+
+    # Load existing chats from output file
+    existing_chats: list[dict[str, Any]] = []
+    existing_ids: set[int] = set()
+    if output_path.exists():
+        try:
+            existing_chats = load_chats_from_json(output_path)
+            existing_ids = {c.get("id") for c in existing_chats if c.get("id") is not None}
+            click.echo(f"Found {len(existing_chats)} existing chats in {output_path}")
+        except (json.JSONDecodeError, OSError):
+            click.echo(f"Warning: Could not read existing file {output_path}, starting fresh")
+
+    client = get_client()
+    async with client:
+        click.echo("Fetching all visible dialogs...")
+        dialog_ids: set[int] = set()
+        async for dialog in client.iter_dialogs():
+            dialog_ids.add(dialog.id)
+        click.echo(f"Found {len(dialog_ids)} visible dialogs")
+
+        legacy_chats: list[dict[str, Any]] = []
+        found_ids: set[int] = set()
+
+        click.echo(f"Searching with {len(search_letters)} characters...")
+        for i, letter in enumerate(search_letters):
+            click.echo(f"[{i + 1}/{len(search_letters)}] Searching '{letter}'...", nl=False)
+
+            try:
+                result = await client(SearchRequest(q=letter, limit=100))
+                new_count = 0
+
+                for user in result.users:
+                    user_id = user.id
+
+                    # Skip if already in dialogs, keep list, existing file, or already found
+                    if user_id in dialog_ids:
+                        continue
+                    if user_id in keep_ids:
+                        continue
+                    if user_id in existing_ids:
+                        continue
+                    if user_id in found_ids:
+                        continue
+
+                    found_ids.add(user_id)
+                    new_count += 1
+
+                    chat_info: dict[str, Any] = {
+                        "id": user_id,
+                        "name": get_entity_name(user),
+                        "type": get_entity_type(user),
+                        "username": getattr(user, "username", None),
+                        "phone": getattr(user, "phone", None),
+                        "source": "search",
+                    }
+                    legacy_chats.append(chat_info)
+
+                click.echo(f" found {new_count} new")
+                await asyncio.sleep(RATE_LIMIT_DELAY)
+
+            except SearchQueryEmptyError:
+                click.echo(" skipped (query not supported)")
+                continue
+
+            except FloodWaitError as e:
+                click.echo(f"\nRate limit hit! Need to wait {e.seconds} seconds")
+                click.echo("Saving progress and stopping...")
+                break
+
+    # Combine and save
+    result = existing_chats + legacy_chats
+    output_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
+
+    click.echo("")
+    click.echo(f"Found {len(legacy_chats)} legacy chats not in dialogs")
+    if existing_chats:
+        click.echo(f"Combined with {len(existing_chats)} existing, total: {len(result)}")
+    click.echo(f"Saved to {output_path}")
 
 
 async def clear_messages(
@@ -830,6 +1037,65 @@ def clear(chat: str, limit: int, dry_run: bool) -> None:
     CHAT can be a username, phone number, or chat ID.
     """
     asyncio.run(clear_messages(chat, limit, dry_run))
+
+
+@cli.command()
+@click.argument(
+    "file",
+    type=click.Path(path_type=Path),
+    default=KEEP_FILE,
+)
+def keep(file: Path) -> None:
+    """View and manage the keep list in an interactive TUI.
+
+    FILE is the path to the keep list JSON file (default: non-delete.json).
+    Use arrow keys or j/k to navigate, Enter or x to remove from keep list, q to quit.
+    """
+    if not file.exists():
+        click.echo(f"Keep list file not found: {file}")
+        return
+
+    try:
+        chats = load_chats_from_json(file)
+    except json.JSONDecodeError:
+        click.echo(f"Error: Invalid JSON in {file}")
+        return
+
+    if not chats:
+        click.echo("Keep list is empty.")
+        return
+
+    click.echo(f"Found {len(chats)} chats in keep list")
+    app = KeepListViewerApp(chats, file)
+    app.run()
+
+
+@cli.command("legacy-chats")
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(path_type=Path),
+    default=Path("legacy_chats.json"),
+    help="Output JSON file path",
+)
+@click.option(
+    "-l",
+    "--letters",
+    type=str,
+    default="abcdefghijklmnopqrstuvwxyz0123456789",
+    help="Characters to search with (default: a-z and 0-9)",
+)
+def legacy_chats(output: Path, letters: str) -> None:
+    """Find legacy chats not visible in your dialog list.
+
+    Some old Telegram chats (before ~2021) don't appear in the normal dialog list
+    but can be found via search. This command searches with each letter a-z and 0-9
+    to find these hidden chats.
+
+    The results are saved to a JSON file for review. You can then use the 'view'
+    command to filter the list before running 'clean'.
+    """
+    asyncio.run(collect_legacy_chats(output, search_letters=letters))
 
 
 if __name__ == "__main__":
